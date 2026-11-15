@@ -210,6 +210,7 @@ const CMD_PREFETCH_ADDR: u8 = 0x02;
 const CMD_SSEC: u64 = 1 << 10;
 const CMD_CFGI_STE: u8 = 0x03;
 const CMD_CFGI_STE_RANGE: u8 = 0x04;
+const CMD_CFGI_STE_RANGE_MASK: u64 = 0x1f;
 const CMD_CFGI_CD: u8 = 0x05;
 const CMD_CFGI_CD_ALL: u8 = 0x06;
 const CMD_TLBI_NH_ALL: u8 = 0x10;
@@ -807,6 +808,24 @@ impl Smmuv3 {
         self.configure_stream(sid)
     }
 
+    fn handle_cfgi_ste_range(&mut self, cmd: &Command) -> Result<(), Error> {
+        // StreamID bits [Range:0] are ignored, Range = 31 covers every SID.
+        let range = (cmd.word1 & CMD_CFGI_STE_RANGE_MASK) as u32;
+        let mask = u32::MAX >> (31 - range);
+        let start = cmd.stream_id() & !mask;
+        let sids: Vec<u32> = self
+            .stream_ids
+            .range(start..=start | mask)
+            .copied()
+            .collect();
+
+        for sid in sids {
+            self.configure_stream(sid)?;
+        }
+
+        Ok(())
+    }
+
     fn configure_stream(&mut self, sid: u32) -> Result<(), Error> {
         if self.cr0 & CR0_SMMUEN == 0 {
             return if self.gbpa & GBPA_ABORT != 0 {
@@ -858,13 +877,7 @@ impl Smmuv3 {
 
         match cmd.opcode {
             CMD_CFGI_STE => self.handle_cfgi_ste(cmd.stream_id()),
-            CMD_CFGI_STE_RANGE => {
-                debug!(
-                    "SMMUv3 CFGI_STE_RANGE (SID {:#x}): no cached STE state",
-                    cmd.stream_id()
-                );
-                Ok(())
-            }
+            CMD_CFGI_STE_RANGE => self.handle_cfgi_ste_range(cmd),
             CMD_ATC_INV if self.idr0 & IDR0_ATS == 0 => Err(Error::IllegalCommand(cmd.opcode)),
             CMD_ATC_INV if self.cr0 & CR0_SMMUEN == 0 => Ok(()),
             CMD_CFGI_CD | CMD_CFGI_CD_ALL | CMD_TLBI_NH_ALL | CMD_TLBI_NH_ASID | CMD_TLBI_NH_VA
@@ -1007,9 +1020,9 @@ impl Migratable for Smmuv3 {}
 
 #[cfg(test)]
 mod tests {
-    use std::io;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::{io, mem};
 
     use vm_device::interrupt::{InterruptIndex, InterruptSourceConfig};
     use vmm_sys_util::eventfd::EventFd;
@@ -1233,6 +1246,139 @@ mod tests {
         smmuv3.write_reg(CR0, u64::from(CR0_CMDQEN), 4).unwrap();
         smmuv3.write_reg(CMDQ_BASE, TEST_CMDQ_BASE | 4, 8).unwrap();
         smmuv3
+    }
+
+    #[derive(Default)]
+    struct RecordingBackend {
+        calls: Mutex<Vec<(&'static str, u32)>>,
+    }
+
+    impl RecordingBackend {
+        fn record(&self, call: &'static str, sid: u32) -> Result<(), IommuError> {
+            self.calls.lock().unwrap().push((call, sid));
+            Ok(())
+        }
+
+        fn take_calls(&self) -> Vec<(&'static str, u32)> {
+            mem::take(&mut *self.calls.lock().unwrap())
+        }
+    }
+
+    impl PhysicalIommu for RecordingBackend {
+        fn hw_info(&self) -> Result<HwInfo, IommuError> {
+            Ok(HwInfo::Smmuv3 {
+                idr: [0; 6],
+                ats_supported: false,
+            })
+        }
+
+        fn install_table_entry(
+            &self,
+            device_id: u32,
+            _entry: TableEntry,
+        ) -> Result<(), IommuError> {
+            self.record("install", device_id)
+        }
+
+        fn set_passthrough(&self, device_id: u32) -> Result<(), IommuError> {
+            self.record("passthrough", device_id)
+        }
+
+        fn set_blocking(&self, device_id: u32) -> Result<(), IommuError> {
+            self.record("blocking", device_id)
+        }
+
+        fn invalidate(&self, _invalidation: Invalidation) -> Result<(), IommuError> {
+            Ok(())
+        }
+    }
+
+    const TEST_STRTAB_BASE: u64 = 0x2000;
+
+    // SMMU enabled with a 16 entry linear stream table and a 16 entry CMDQ.
+    fn enabled_smmuv3(backend: &Arc<RecordingBackend>) -> Smmuv3 {
+        let mem = GuestMemoryAtomic::new(
+            GuestMemory::from_ranges(&[(GuestAddress(0), 0x1_0000)]).unwrap(),
+        );
+        let group = || Arc::new(NoopInterrupts) as Arc<dyn InterruptSourceGroup>;
+        let mut smmuv3 = Smmuv3::new(
+            "smmuv3".to_string(),
+            mem,
+            Smmuv3Interrupts {
+                event: group(),
+                gerror: group(),
+                sync: group(),
+            },
+            Arc::clone(backend) as Arc<dyn PhysicalIommu>,
+            None,
+        );
+
+        smmuv3.write_reg(STRTAB_BASE, TEST_STRTAB_BASE, 8).unwrap();
+        smmuv3.write_reg(STRTAB_BASE_CFG, 4, 4).unwrap();
+        smmuv3.write_reg(CMDQ_BASE, TEST_CMDQ_BASE | 4, 8).unwrap();
+        smmuv3
+            .write_reg(CR0, u64::from(CR0_SMMUEN | CR0_CMDQEN), 4)
+            .unwrap();
+        smmuv3
+    }
+
+    fn write_ste(smmuv3: &Smmuv3, sid: u32, config: u8) {
+        let word0 = STE_V | (u64::from(config) << STE_CONFIG_SHIFT);
+        smmuv3
+            .mem
+            .memory()
+            .write_obj::<u64>(
+                word0,
+                GuestAddress(TEST_STRTAB_BASE + u64::from(sid) * STE_SIZE),
+            )
+            .unwrap();
+    }
+
+    fn submit_command(smmuv3: &mut Smmuv3, word0: u64, word1: u64) {
+        let addr = TEST_CMDQ_BASE + u64::from(smmuv3.cmdq_prod & 0xf) * CMDQ_ENTRY_SIZE;
+        let mem = smmuv3.mem.memory();
+        mem.write_obj::<u64>(word0, GuestAddress(addr)).unwrap();
+        mem.write_obj::<u64>(word1, GuestAddress(addr + 8)).unwrap();
+
+        let prod = QueueLayout::new(smmuv3.cmdq_base).next_pointer(smmuv3.cmdq_prod);
+        smmuv3.write_reg(CMDQ_PROD, u64::from(prod), 4).unwrap();
+    }
+
+    #[test]
+    fn test_cfgi_ste_range_reconfigures_streams_in_range() {
+        let backend = Arc::new(RecordingBackend::default());
+        let mut smmuv3 = enabled_smmuv3(&backend);
+
+        for sid in [1, 3, 4] {
+            write_ste(&smmuv3, sid, STE_CONFIG_S1_ONLY);
+            submit_command(
+                &mut smmuv3,
+                u64::from(CMD_CFGI_STE) | (u64::from(sid) << 32),
+                0,
+            );
+        }
+        assert_eq!(
+            backend.take_calls(),
+            [("install", 1), ("install", 3), ("install", 4)]
+        );
+
+        // Abort SIDs 1, 3 and 4, then invalidate SIDs 2 and 3 (Range = 0)
+        // and SIDs 0 to 3 (Range = 1).
+        for sid in [1, 3, 4] {
+            write_ste(&smmuv3, sid, 0);
+        }
+        submit_command(&mut smmuv3, u64::from(CMD_CFGI_STE_RANGE) | (2 << 32), 0);
+        assert_eq!(backend.take_calls(), [("blocking", 3)]);
+        submit_command(&mut smmuv3, u64::from(CMD_CFGI_STE_RANGE) | (2 << 32), 1);
+        assert_eq!(backend.take_calls(), [("blocking", 1), ("blocking", 3)]);
+
+        // CFGI_ALL is CFGI_STE_RANGE with Range = 31.
+        submit_command(&mut smmuv3, u64::from(CMD_CFGI_STE_RANGE), 31);
+        assert_eq!(
+            backend.take_calls(),
+            [("blocking", 1), ("blocking", 3), ("blocking", 4)]
+        );
+        assert_eq!(cmdq_error(&smmuv3), 0);
     }
 
     fn cmdq_error(smmuv3: &Smmuv3) -> u32 {
