@@ -80,6 +80,10 @@ pub enum VhdxMetadataError {
     InvalidPhysicalSectorSize,
     #[error("Invalid value")]
     InvalidValue,
+    #[error("Metadata item at offset {0:#x} lies outside the metadata region")]
+    MetadataItemOutsideRegion(u32),
+    #[error("Metadata region length {0:#x} is smaller than the metadata table")]
+    MetadataRegionTooSmall(u32),
     #[error("Not all required metadata found")]
     MissingMetadata,
     #[error("Failed to read metadata headers {0}")]
@@ -119,6 +123,14 @@ impl DiskSpec {
             .map_err(VhdxMetadataError::ReadMetadata)?;
         disk_spec.image_size = metadata.len();
 
+        // Guest writes are only kept out of the metadata region itself, so
+        // the table and the items read below must lie within it.
+        if (metadata_region.length as usize) < METADATA_TABLE_MAX_SIZE {
+            return Err(VhdxMetadataError::MetadataRegionTooSmall(
+                metadata_region.length,
+            ));
+        }
+
         let mut buffer = [0u8; METADATA_TABLE_MAX_SIZE];
         f.read_exact_at(&mut buffer, metadata_region.file_offset)
             .map_err(VhdxMetadataError::ReadMetadata)?;
@@ -132,7 +144,7 @@ impl DiskSpec {
                 MetadataTableEntry::new(&buffer[offset..offset + size_of::<MetadataTableEntry>()])?;
 
             let presence = if metadata_entry.item_id == METADATA_FILE_PARAMETER {
-                let item = metadata_entry.read_item::<8>(f, metadata_region.file_offset)?;
+                let item = metadata_entry.read_item::<8>(f, metadata_region)?;
                 disk_spec.block_size = u32::from_le_bytes(item[0..4].try_into().unwrap());
 
                 // MUST be at least 1 MiB and not greater than 256 MiB
@@ -150,17 +162,17 @@ impl DiskSpec {
 
                 METADATA_FILE_PARAMETER_PRESENT
             } else if metadata_entry.item_id == METADATA_VIRTUAL_DISK_SIZE {
-                let item = metadata_entry.read_item::<8>(f, metadata_region.file_offset)?;
+                let item = metadata_entry.read_item::<8>(f, metadata_region)?;
                 disk_spec.virtual_disk_size = u64::from_le_bytes(item);
 
                 METADATA_VIRTUAL_DISK_SIZE_PRESENT
             } else if metadata_entry.item_id == METADATA_VIRTUAL_DISK_ID {
-                let item = metadata_entry.read_item::<16>(f, metadata_region.file_offset)?;
+                let item = metadata_entry.read_item::<16>(f, metadata_region)?;
                 disk_spec.disk_id = u128::from_le_bytes(item);
 
                 METADATA_VIRTUAL_DISK_ID_PRESENT
             } else if metadata_entry.item_id == METADATA_LOGICAL_SECTOR_SIZE {
-                let item = metadata_entry.read_item::<4>(f, metadata_region.file_offset)?;
+                let item = metadata_entry.read_item::<4>(f, metadata_region)?;
                 disk_spec.logical_sector_size = u32::from_le_bytes(item);
                 if disk_spec.logical_sector_size != 512 {
                     return Err(VhdxMetadataError::InvalidLogicalSectorSize);
@@ -168,7 +180,7 @@ impl DiskSpec {
 
                 METADATA_LOGICAL_SECTOR_SIZE_PRESENT
             } else if metadata_entry.item_id == METADATA_PHYSICAL_SECTOR_SIZE {
-                let item = metadata_entry.read_item::<4>(f, metadata_region.file_offset)?;
+                let item = metadata_entry.read_item::<4>(f, metadata_region)?;
                 disk_spec.physical_sector_size = u32::from_le_bytes(item);
                 if !(disk_spec.physical_sector_size == 512
                     || disk_spec.physical_sector_size == 4096)
@@ -285,8 +297,15 @@ pub(super) struct MetadataTableEntry {
 }
 
 impl MetadataTableEntry {
-    fn read_item<const N: usize>(&self, f: &AlignedFile, region_offset: u64) -> Result<[u8; N]> {
-        let offset = region_offset + self.offset as u64;
+    fn read_item<const N: usize>(
+        &self,
+        f: &AlignedFile,
+        region: &RegionTableEntry,
+    ) -> Result<[u8; N]> {
+        if self.offset as u64 + N as u64 > region.length as u64 {
+            return Err(VhdxMetadataError::MetadataItemOutsideRegion(self.offset));
+        }
+        let offset = region.file_offset + self.offset as u64;
         let mut item = [0u8; N];
         f.read_exact_at(&mut item, offset)
             .map_err(VhdxMetadataError::ReadMetadata)?;

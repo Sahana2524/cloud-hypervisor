@@ -422,6 +422,8 @@ mod tests {
     const VHDX_HEADER_2_OFFSET: u64 = 0x20000;
     const VHDX_HEADER_SIZE: usize = 4096;
     const VHDX_LOG_GUID_OFFSET: usize = 48;
+    const VHDX_REGION_TABLE_SIZE: usize = 64 * 1024;
+    const VHDX_METADATA_TABLE_HEADER_SIZE: u64 = 32;
 
     #[test]
     fn bat_index_skips_sector_bitmap_entries() {
@@ -771,6 +773,85 @@ mod tests {
         assert!(
             first.iter().all(|&b| b == 0),
             "sector 0 of the block was overwritten"
+        );
+    }
+
+    /// A metadata region too small to hold the metadata table would let the
+    /// table sit outside the area protected from guest writes.
+    #[test]
+    fn open_with_empty_metadata_region_is_rejected() {
+        let tf = create_dynamic_vhdx(16, None);
+        let mdr_offset = open_vhdx(tf.as_path()).unwrap().mdr_entry.file_offset;
+
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tf.as_path())
+            .unwrap();
+        edit_header(
+            &file,
+            header::REGION_TABLE_1_START,
+            VHDX_REGION_TABLE_SIZE,
+            |table| {
+                // Entries follow the 16-byte table header: GUID, file offset,
+                // length.
+                for entry in table[16..].as_chunks_mut::<32>().0 {
+                    if entry[16..24] == mdr_offset.to_le_bytes() {
+                        entry[24..28].fill(0);
+                    }
+                }
+            },
+        );
+        file.sync_all().unwrap();
+
+        let err = Vhdx::new(file, false).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VhdxError::ParseVhdxMetadata(VhdxMetadataError::MetadataRegionTooSmall(0))
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// A metadata item placed past the end of the metadata region is not
+    /// protected from guest writes, so it must be rejected.
+    #[test]
+    fn open_with_metadata_item_outside_region_is_rejected() {
+        let tf = create_dynamic_vhdx(16, None);
+        let vhdx = open_vhdx(tf.as_path()).unwrap();
+        let mdr_offset = vhdx.mdr_entry.file_offset;
+        let mdr_length = vhdx.mdr_entry.length;
+        drop(vhdx);
+
+        // Move the first metadata item to the first byte past the region.
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tf.as_path())
+            .unwrap();
+        let entry = mdr_offset + VHDX_METADATA_TABLE_HEADER_SIZE;
+        let mut location = [0u8; 8];
+        file.read_exact_at(&mut location, entry + 16).unwrap();
+        let item_offset = u32::from_le_bytes(location[0..4].try_into().unwrap());
+        let item_length = u32::from_le_bytes(location[4..8].try_into().unwrap());
+        let mut item = vec![0u8; item_length as usize];
+        file.read_exact_at(&mut item, mdr_offset + item_offset as u64)
+            .unwrap();
+        file.write_all_at(&item, mdr_offset + mdr_length as u64)
+            .unwrap();
+        file.write_all_at(&mdr_length.to_le_bytes(), entry + 16)
+            .unwrap();
+        file.sync_all().unwrap();
+
+        let err = Vhdx::new(file, false).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VhdxError::ParseVhdxMetadata(VhdxMetadataError::MetadataItemOutsideRegion(offset))
+                    if offset == mdr_length
+            ),
+            "unexpected error: {err:?}"
         );
     }
 }
