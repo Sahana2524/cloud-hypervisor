@@ -41,11 +41,15 @@ macro_rules! movs {
             let backwards = string_op_backwards(state.flags());
             let len = size_of::<$bound>();
 
+            // The source segment defaults to DS but a prefix may override it,
+            // unlike the ES destination which the SDM fixes for string ops.
+            let src_segment = insn.memory_segment();
+
             while count > 0 {
                 let mut memory: [u8; 8] = [0; 8];
 
                 let src = state
-                    .linearize(Register::DS, rsi, false)
+                    .linearize(src_segment, rsi, false)
                     .map_err(|e| EmulationError::InvalidOperand(anyhow!(e)))?;
                 let dst = state
                     .linearize(Register::ES, rdi, true)
@@ -104,6 +108,7 @@ impl<T: CpuStateManager> InstructionHandler<T> for Movsb_m8_m8 {
 mod tests {
     use super::*;
     use crate::arch::x86::emulator::mock_vmm::*;
+    use crate::arch::x86::gdt::{gdt_entry, segment_from_gdt};
 
     #[test]
     fn test_rep_movsq_m64_m64() {
@@ -313,5 +318,33 @@ mod tests {
         // The rest should be default value 0 from MockVmm
         vmm.read_memory(0x8 + 6, &mut data).unwrap();
         assert_eq!(0x0, data[0]);
+    }
+
+    #[test]
+    fn test_movsb_with_segment_override() {
+        let ip: u64 = 0x1000;
+        // 0xaa sits at DS:0 and 0x55 at FS:0, so the byte that gets copied
+        // tells us which segment the source was linearized through.
+        let mut memory = [0u8; 32];
+        memory[0x0] = 0xaa;
+        memory[0x10] = 0x55;
+        let insn = [0x64, 0xa4]; // movsb byte ptr es:[rdi], byte ptr fs:[rsi]
+        let regs = vec![(Register::ESI, 0), (Register::EDI, 0x18)];
+
+        let mut vmm = MockVmm::new(ip, regs, Some((0, &memory)));
+        let mut state = vmm.cpu_state(0).unwrap();
+        state
+            .write_segment(
+                Register::FS,
+                segment_from_gdt(gdt_entry(0xc093, 0x10, 0xffffffff), 4),
+            )
+            .unwrap();
+        vmm.set_cpu_state(0, state).unwrap();
+
+        vmm.emulate_first_insn(0, &insn).unwrap();
+
+        let mut data = [0u8; 1];
+        vmm.read_memory(0x18, &mut data).unwrap();
+        assert_eq!(0x55, data[0]);
     }
 }
